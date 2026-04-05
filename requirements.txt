@@ -2,15 +2,11 @@ fastapi
 uvicorn[standard]
 pydantic
 python-dotenv
-requests
-
 langchain
-langchain-community
 langchain-chroma
+langchain-community
 chromadb
-
 google-search-results
 groq
-
 sentence-transformers
-torch (cpu)
+torch --index-url https://download.pytorch.org/whl/cpu
