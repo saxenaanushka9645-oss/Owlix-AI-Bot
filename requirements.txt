@@ -3,9 +3,9 @@ uvicorn[standard]
 pydantic
 python-dotenv
 langchain
-langchain-google-genai
 langchain-chroma
 langchain-community
-google-generativeai
 chromadb
 google-search-results
+groq
+sentence-transformers
