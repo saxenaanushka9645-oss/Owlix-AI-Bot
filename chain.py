@@ -323,10 +323,11 @@ def compute_credibility(sources: list, raw_response: str, query_timestamp: float
             set((s.get("snippet") or "").lower().split())
             for s in sources if s.get("snippet")
         ]
+
         if len(snippets) >= 2:
             all_w  = snippets[0].union(*snippets[1:])
             comm_w = snippets[0].intersection(*snippets[1:])
-            agreement = len(comm_w) / len(all_w) if all_w else 0.0
+            agreement = min(len(comm_w) / len(all_w) + 0.15, 1.0) if all_w else 0.0
         elif len(snippets) == 1:
             agreement = 0.5
         else:
@@ -334,19 +335,22 @@ def compute_credibility(sources: list, raw_response: str, query_timestamp: float
 
         contra_words = ["however", "contrary", "disputes", "contradicts",
                         "disagrees", "refutes", "debunked"]
+
         raw_lower  = raw_response.lower()
         contra_cnt = sum(raw_lower.count(w) for w in contra_words)
         consistency = max(0.0, 1.0 - min(contra_cnt * 0.1, 0.5))
 
+        # ✅ FIX 3 (correct placement)
         current_year = str(datetime.now(timezone.utc).year)
         has_recent   = any(
             current_year in (s.get("url", "") + s.get("snippet", ""))
             for s in sources
         )
-        time_score = 1.0 if has_recent else 0.6
+        time_score = 1.0 if has_recent else 0.75
 
         bias_signals = ["always", "never", "everyone knows", "obviously",
                         "clearly", "undeniably", "without a doubt"]
+
         bias_cnt   = sum(raw_lower.count(b) for b in bias_signals)
         bias_flag  = bias_cnt >= 3
         bias_score = max(0.0, 1.0 - bias_cnt * 0.08)
@@ -358,7 +362,14 @@ def compute_credibility(sources: list, raw_response: str, query_timestamp: float
             time_score  * 0.15 +
             bias_score  * 0.10
         )
-        label = "High" if composite >= 0.70 else ("Medium" if composite >= 0.42 else "Low")
+
+        # ✅ FIX 4 (MISSING in your code)
+        if len(sources) >= 3 and avg_cred > 0.6:
+            composite += 0.05
+
+        composite = min(composite, 1.0)
+
+        label = "High" if composite >= 0.60 else ("Medium" if composite >= 0.35 else "Low")
 
         return {
             "confidence":         label,
