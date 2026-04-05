@@ -1,23 +1,10 @@
 """
 Owlix RAG Chain — full pipeline Steps 0–13
 ==========================================
-BACKEND: Groq Inference API (replaces Hugging Face)
+BACKEND: Groq Inference API
 
 Chat/Reasoning model  : llama-3.3-70b-versatile (Groq — free tier, ultra-fast)
-Embedding model       : sentence-transformers/all-MiniLM-L6-v2
-                        (tiny 80 MB model, 384-dim, excellent speed/accuracy balance)
-
-Step 0/1  : Input validation & text preprocessing
-Step 2    : Query rewriting with conversational memory (ambiguity detection)
-Step 3    : Web retrieval via SerpAPI (retry × 3, timeout, empty-results handling)
-Step 4    : Source credibility scoring & ranking (trusted-domain tiers)
-Step 5    : Deduplication & context-size limiting
-Step 6    : Semantic memory retrieval via ChromaDB (graceful skip on failure)
-Step 7    : LLM reasoning (Groq API) — retry once, hallucination-risk flagging
-Step 8    : Credibility framework — multi-factor confidence computation
-Step 9    : Low-confidence handling — additional retrieval + user warning
-Step 10   : Response metrics — Precision, Recall, Faithfulness (approximate)
-Step 13   : Memory update (Chroma + in-process buffer, failure-safe)
+Embedding model       : ChromaDB built-in ONNX MiniLM-L6-v2 (no torch needed)
 """
 
 import os
@@ -30,12 +17,10 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 import requests
-
+from groq import Groq
 from langchain_chroma import Chroma
 from langchain_community.utilities import SerpAPIWrapper
-
-# ChromaDB embedding wrapper for sentence-transformers
-from chromadb import EmbeddingFunction, Documents, Embeddings
+from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
 
 load_dotenv()
 
@@ -44,11 +29,8 @@ logger = logging.getLogger("owlix.chain")
 # ── Environment variables ─────────────────────────────────────────────────────
 GROQ_API_KEY       = os.getenv("GROQ_API_KEY")
 SERPAPI_API_KEY    = os.getenv("SERPAPI_API_KEY")
-#CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "/tmp/chroma_db")
-
 GROQ_CHAT_MODEL    = os.getenv("GROQ_CHAT_MODEL", "llama-3.3-70b-versatile")
-HF_EMBEDDING_MODEL = os.getenv("HF_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
 if not GROQ_API_KEY:
     raise EnvironmentError("GROQ_API_KEY is not set in .env")
@@ -141,10 +123,6 @@ class GroqInferenceClient:
         logger.info("Groq client initialised — model: %s", self.model)
 
     def invoke(self, system: str, user: str) -> str:
-        """
-        Send a chat completion request to Groq and return the assistant text.
-        Raises RuntimeError on non-recoverable errors.
-        """
         for attempt in range(1, 4):
             try:
                 response = self.client.chat.completions.create(
@@ -161,85 +139,52 @@ class GroqInferenceClient:
             except Exception as exc:
                 err_str = str(exc).lower()
 
-                # Rate-limit / quota → wait and retry
                 if "429" in err_str or "rate_limit" in err_str or "too many" in err_str:
                     wait = 5 * attempt
-                    logger.warning(
-                        "Groq rate-limited (attempt %d/3), waiting %ds: %s", attempt, wait, exc
-                    )
+                    logger.warning("Groq rate-limited (attempt %d/3), waiting %ds: %s", attempt, wait, exc)
                     if attempt < 3:
                         time.sleep(wait)
                         continue
                     raise RuntimeError(f"Groq rate limit exceeded after retries: {exc}") from exc
 
-                # Service unavailable → short wait and retry
                 if "503" in err_str or "service unavailable" in err_str:
                     wait = 3 * attempt
-                    logger.warning(
-                        "Groq service unavailable (attempt %d/3), waiting %ds: %s", attempt, wait, exc
-                    )
+                    logger.warning("Groq service unavailable (attempt %d/3), waiting %ds: %s", attempt, wait, exc)
                     if attempt < 3:
                         time.sleep(wait)
                         continue
                     raise RuntimeError(f"Groq service unavailable: {exc}") from exc
 
-                # Auth errors — non-recoverable
                 if "401" in err_str or "403" in err_str or "invalid_api_key" in err_str:
                     raise RuntimeError(
                         f"Groq API key is invalid or lacks permissions. "
                         f"Check GROQ_API_KEY in your .env file. Details: {exc}"
                     ) from exc
 
-                # All other errors — raise immediately
                 raise RuntimeError(f"Groq API error: {exc}") from exc
 
         raise RuntimeError("Groq invoke failed after all retries.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sentence-Transformers embedding function (ChromaDB compatible)
+# LangChain-compatible embedding wrapper using ChromaDB's built-in ONNX model
+# No torch / sentence-transformers needed
 # ─────────────────────────────────────────────────────────────────────────────
-class STEmbeddingFunction(EmbeddingFunction):
-    def __init__(self, model_name: str = HF_EMBEDDING_MODEL):
-        self.model = SentenceTransformer(model_name)
-        logger.info("Loaded embedding model: %s", model_name)
-
-    def __call__(self, input: Documents) -> Embeddings:
-        vecs = self.model.encode(list(input), show_progress_bar=False)
-        return vecs.tolist()
-
-
-from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
-
 class STLangChainEmbeddings:
+    """
+    Wraps ChromaDB's ONNXMiniLM_L6_V2 embedding function in a
+    LangChain-compatible interface. Same model as all-MiniLM-L6-v2,
+    runs via onnxruntime — no PyTorch dependency.
+    """
     def __init__(self, model_name: str = None):
         self._fn = ONNXMiniLM_L6_V2()
+        logger.info("ONNX MiniLM-L6-v2 embedding function loaded.")
 
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+    def embed_documents(self, texts: list) -> list:
         return self._fn(texts)
 
-    def embed_query(self, text: str) -> list[float]:
+    def embed_query(self, text: str) -> list:
         return self._fn([text])[0]
-
-    def _get_model(self):
-        if self.model is None:
-            from sentence_transformers import SentenceTransformer
-            self.model = SentenceTransformer(self.model_name, device="cpu")
-        return self.model
-
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        model = self._get_model()
-        return model.encode(texts, show_progress_bar=False).tolist()
-
-    def embed_query(self, text: str) -> list[float]:
-        model = self._get_model()
-        return model.encode([text], show_progress_bar=False)[0].tolist()
-
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return self.model.encode(texts, show_progress_bar=False).tolist()
-
-    def embed_query(self, text: str) -> list[float]:
-        return self.model.encode([text], show_progress_bar=False)[0].tolist()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -288,13 +233,13 @@ _HIGH_NOISE_TOKENS = {
     "hm", "huh", "wow", "cool", "great", "nice", "yep", "nope", "nah",
 }
 
-def rank_query_noise(query: str) -> tuple[str, float]:
+def rank_query_noise(query: str) -> tuple:
     tokens = re.findall(r"\b\w{2,}\b", query.lower())
     if not tokens:
         raise ValueError("Query cannot be empty. Please enter a valid question.")
 
-    signal   = [t for t in tokens if t not in _HIGH_NOISE_TOKENS]
-    score    = len(signal) / len(tokens)
+    signal        = [t for t in tokens if t not in _HIGH_NOISE_TOKENS]
+    score         = len(signal) / len(tokens)
     question_words = {"what", "who", "when", "where", "why", "how", "which", "whose"}
     if any(t in question_words for t in tokens):
         score = min(score + 0.15, 1.0)
@@ -340,10 +285,10 @@ def score_source(source: dict) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 5: Deduplication
 # ─────────────────────────────────────────────────────────────────────────────
-def deduplicate_sources(sources: list[dict]) -> list[dict]:
-    seen_urls: set[str] = set()
-    seen_snippets: list[set] = []
-    deduped: list[dict] = []
+def deduplicate_sources(sources: list) -> list:
+    seen_urls: set     = set()
+    seen_snippets: list = []
+    deduped: list      = []
 
     for src in sources:
         url     = (src.get("url") or "").strip().rstrip("/")
@@ -368,11 +313,7 @@ def deduplicate_sources(sources: list[dict]) -> list[dict]:
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 8: Multi-factor credibility framework
 # ─────────────────────────────────────────────────────────────────────────────
-def compute_credibility(
-    sources: list[dict],
-    raw_response: str,
-    query_timestamp: float,
-) -> dict:
+def compute_credibility(sources: list, raw_response: str, query_timestamp: float) -> dict:
     try:
         avg_cred = (
             sum(score_source(s) for s in sources) / len(sources) if sources else 0.0
@@ -391,12 +332,10 @@ def compute_credibility(
         else:
             agreement = 0.0
 
-        contra_words = [
-            "however", "contrary", "disputes", "contradicts",
-            "disagrees", "refutes", "debunked",
-        ]
-        raw_lower   = raw_response.lower()
-        contra_cnt  = sum(raw_lower.count(w) for w in contra_words)
+        contra_words = ["however", "contrary", "disputes", "contradicts",
+                        "disagrees", "refutes", "debunked"]
+        raw_lower  = raw_response.lower()
+        contra_cnt = sum(raw_lower.count(w) for w in contra_words)
         consistency = max(0.0, 1.0 - min(contra_cnt * 0.1, 0.5))
 
         current_year = str(datetime.now(timezone.utc).year)
@@ -406,10 +345,8 @@ def compute_credibility(
         )
         time_score = 1.0 if has_recent else 0.6
 
-        bias_signals = [
-            "always", "never", "everyone knows", "obviously",
-            "clearly", "undeniably", "without a doubt",
-        ]
+        bias_signals = ["always", "never", "everyone knows", "obviously",
+                        "clearly", "undeniably", "without a doubt"]
         bias_cnt   = sum(raw_lower.count(b) for b in bias_signals)
         bias_flag  = bias_cnt >= 3
         bias_score = max(0.0, 1.0 - bias_cnt * 0.08)
@@ -445,7 +382,7 @@ def compute_credibility(
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 10: Response metrics
 # ─────────────────────────────────────────────────────────────────────────────
-def compute_metrics(query: str, response: dict, sources: list[dict]) -> dict:
+def compute_metrics(query: str, response: dict, sources: list) -> dict:
     try:
         summary      = (response.get("summary") or "").lower()
         sum_words    = set(re.findall(r"\b\w{4,}\b", summary))
@@ -456,12 +393,8 @@ def compute_metrics(query: str, response: dict, sources: list[dict]) -> dict:
         source_words = set(re.findall(r"\b\w{4,}\b", source_text))
         query_words  = set(re.findall(r"\b\w{4,}\b", query.lower()))
 
-        precision = (
-            len(sum_words & source_words) / len(sum_words) if sum_words else 0.5
-        )
-        recall = (
-            len(query_words & sum_words) / len(query_words) if query_words else 0.5
-        )
+        precision = len(sum_words & source_words) / len(sum_words) if sum_words else 0.5
+        recall    = len(query_words & sum_words) / len(query_words) if query_words else 0.5
         full_text    = json.dumps(response).lower()
         hall_hits    = sum(1 for sig in HALLUCINATION_SIGNALS if sig in full_text)
         faithfulness = max(0.0, 1.0 - hall_hits * 0.12)
@@ -482,11 +415,11 @@ def compute_metrics(query: str, response: dict, sources: list[dict]) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Conversation memory (Steps 2 & 13)
+# Conversation memory
 # ─────────────────────────────────────────────────────────────────────────────
 class SimpleMemory:
     def __init__(self):
-        self.history: list[dict] = []
+        self.history: list = []
 
     def add(self, human: str, ai: str):
         self.history.append({"human": human, "ai": ai})
@@ -519,9 +452,8 @@ def extract_json_from_llm_output(raw_text: str) -> dict:
     start = cleaned.find("{")
     end   = cleaned.rfind("}")
     if start != -1 and end != -1 and end > start:
-        json_candidate = cleaned[start:end+1]
         try:
-            return json.loads(json_candidate)
+            return json.loads(cleaned[start:end+1])
         except json.JSONDecodeError:
             pass
 
@@ -549,21 +481,29 @@ def extract_json_from_llm_output(raw_text: str) -> dict:
 class OwlixChain:
     def __init__(self):
         logger.info("Initialising OwlixChain (Groq backend)...")
-        logger.info("Chat model  : %s", GROQ_CHAT_MODEL)
-        logger.info("Embed model : %s", HF_EMBEDDING_MODEL)
+        logger.info("Chat model : %s", GROQ_CHAT_MODEL)
 
         self.llm        = GroqInferenceClient(GROQ_API_KEY, GROQ_CHAT_MODEL)
-        self.embeddings = STLangChainEmbeddings(HF_EMBEDDING_MODEL)
+        self.embeddings = STLangChainEmbeddings()
 
-        self.vectorstore = Chroma(
-            persist_directory=CHROMA_PERSIST_DIR,
-            embedding_function=self.embeddings,
-            collection_name="owlix_memory",
-        )
+        # Lazy init — vectorstore loads on first query, not at startup
+        # This lets uvicorn bind the port before any heavy loading occurs
+        self._vectorstore = None
 
         self.search   = SerpAPIWrapper(serpapi_api_key=SERPAPI_API_KEY)
-        self.memories: dict[str, SimpleMemory] = {}
+        self.memories: dict = {}
         logger.info("OwlixChain ready.")
+
+    @property
+    def vectorstore(self):
+        if self._vectorstore is None:
+            logger.info("Initialising vectorstore on first use...")
+            self._vectorstore = Chroma(
+                persist_directory=CHROMA_PERSIST_DIR,
+                embedding_function=self.embeddings,
+                collection_name="owlix_memory",
+            )
+        return self._vectorstore
 
     def _get_memory(self, session_id: str) -> SimpleMemory:
         if session_id not in self.memories:
@@ -585,9 +525,7 @@ class OwlixChain:
             logger.warning("Query resolution failed: %s", exc)
             return raw
 
-    def _retrieve_web_sync(
-        self, query: str, max_retries: int = WEB_MAX_RETRIES
-    ) -> tuple[str, list[dict]]:
+    def _retrieve_web_sync(self, query: str, max_retries: int = WEB_MAX_RETRIES) -> tuple:
         last_error = None
         for attempt in range(1, max_retries + 1):
             try:
@@ -605,9 +543,7 @@ class OwlixChain:
                 return "\n\n".join(parts), sources
             except Exception as exc:
                 last_error = exc
-                logger.warning(
-                    "Web retrieval attempt %d/%d failed: %s", attempt, max_retries, exc
-                )
+                logger.warning("Web retrieval attempt %d/%d failed: %s", attempt, max_retries, exc)
                 if attempt < max_retries:
                     time.sleep(1.5 * attempt)
 
