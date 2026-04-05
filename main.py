@@ -1,21 +1,17 @@
 """
-Owlix FastAPI backend — Steps 10 / 11 / 12 / Global Validation
-===============================================================
-BACKEND: Groq Inference API (replaces Hugging Face)
-
-CHANGES (v4.0.0):
-  - Replaced HF_API_TOKEN with GROQ_API_KEY
-  - Removed all HF-specific references from health endpoint
-  - /speech-to-text returns proper fallback flag so frontend knows to use browser STT
-  - CORS allows all origins for local dev
-  - /tts endpoint validates and pre-processes text for browser SpeechSynthesis
+Owlix FastAPI backend — v4.1.0
+================================
+- OwlixChain initialised inside @app.lifespan (after port is bound)
+- Uvicorn binds port 10000 immediately at startup
+- No module-level heavy imports that could crash before port binding
 """
-
 
 import logging
 import traceback
 import os
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+
 load_dotenv()
 
 from fastapi import FastAPI, HTTPException, Request
@@ -26,8 +22,6 @@ from typing import Optional, Any
 import uvicorn
 import requests as _requests
 
-from chain import OwlixChain
-
 # ── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -35,7 +29,35 @@ logging.basicConfig(
 )
 logger = logging.getLogger("owlix")
 
-app = FastAPI(title="Owlix RAG API", version="4.0.0")
+# ── Google Speech API key (optional) ──────────────────────────────────────
+GOOGLE_SPEECH_API_KEY = os.getenv("GOOGLE_SPEECH_API_KEY", "")
+
+# ── Global chain instance (set during lifespan startup) ───────────────────
+owlix = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Runs AFTER uvicorn binds the port.
+    Heavy initialisation (Groq client, ChromaDB, SerpAPI) happens here.
+    """
+    global owlix
+    logger.info("==> Lifespan startup: initialising OwlixChain...")
+    try:
+        from chain import OwlixChain
+        owlix = OwlixChain()
+        logger.info("==> OwlixChain ready.")
+    except Exception as exc:
+        logger.error("==> OwlixChain init failed: %s\n%s", exc, traceback.format_exc())
+        # Don't raise — let the app stay up so Render sees an open port.
+        # Queries will return a 503 until chain is ready.
+    yield
+    # Shutdown
+    logger.info("==> Lifespan shutdown.")
+
+
+app = FastAPI(title="Owlix RAG API", version="4.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,11 +66,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-owlix = OwlixChain()
-
-# Google Speech API key from env (optional)
-GOOGLE_SPEECH_API_KEY = os.getenv("GOOGLE_SPEECH_API_KEY", "")
 
 
 # ── Request / Response models ──────────────────────────────────────────────
@@ -66,17 +83,10 @@ class QueryRequest(BaseModel):
 
 
 class SpeechRequest(BaseModel):
-    """Step 12: Voice input — base64-encoded audio + language code."""
     audio_base64: str
-    encoding:     str  = "WEBM_OPUS"
-    sample_rate:  int  = 48000
-    lang:         str  = "en-US"
-
-
-class TTSRequest(BaseModel):
-    """Step 12: Text-to-Speech request."""
-    text: str
-    lang: Optional[str] = "en-US"
+    encoding:     str = "WEBM_OPUS"
+    sample_rate:  int = 48000
+    lang:         str = "en-US"
 
 
 class MetricsModel(BaseModel):
@@ -107,14 +117,14 @@ class QueryResponse(BaseModel):
     conclusion:     str
     uncertainty:    str
     confidence:     str
-    followups:      list[str]
-    sources:        list[dict]
-    metrics:            Optional[MetricsModel]      = None
-    credibility_report: Optional[CredibilityReport] = None
+    followups:      list
+    sources:        list
+    metrics:              Optional[MetricsModel]      = None
+    credibility_report:   Optional[CredibilityReport] = None
     resolved_query:       Optional[str]  = None
     clarification_needed: Optional[bool] = False
     detected_lang:        Optional[str]  = "en-US"
-    tts_available: Optional[bool] = True
+    tts_available:        Optional[bool] = True
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -155,7 +165,6 @@ def _is_groq_unavailable(exc: Exception) -> bool:
 
 
 def clean_text_for_tts(text: str) -> str:
-    """Strip markdown, URLs, and special symbols so TTS sounds natural."""
     import re
     text = re.sub(r'https?://\S+', '', text)
     text = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', text)
@@ -169,13 +178,19 @@ def clean_text_for_tts(text: str) -> str:
 
 @app.get("/")
 def root():
-    return {"status": "Owlix is running", "version": "4.0.0", "backend": "Groq"}
+    return {
+        "status": "Owlix is running",
+        "version": "4.1.0",
+        "backend": "Groq",
+        "chain_ready": owlix is not None,
+    }
 
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
+        "chain_ready":  owlix is not None,
         "llm_backend":  "groq",
         "tts_backend":  "browser-native",
         "stt_backend":  "google" if GOOGLE_SPEECH_API_KEY else "browser-native",
@@ -184,6 +199,12 @@ def health():
 
 @app.post("/query", response_model=QueryResponse)
 async def query_endpoint(req: QueryRequest):
+    if owlix is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Service is still initialising. Please try again in a few seconds."
+        )
+
     try:
         logger.info("Received query: %r | session: %s", req.query, req.session_id)
         result = await owlix.run(req.query, req.session_id)
@@ -205,7 +226,10 @@ async def query_endpoint(req: QueryRequest):
             result["sources"] = []
 
         if not result.get("metrics"):
-            result["metrics"] = {"approximate": True, "confidence_only": result.get("confidence", "Low")}
+            result["metrics"] = {
+                "approximate": True,
+                "confidence_only": result.get("confidence", "Low"),
+            }
 
         if not result.get("credibility_report"):
             result["credibility_report"] = {"confidence": result.get("confidence", "Low")}
@@ -219,11 +243,11 @@ async def query_endpoint(req: QueryRequest):
         return result
 
     except RuntimeError as exc:
-        logger.error("=== QUERY FAILED (Groq RuntimeError) ===\n%s", traceback.format_exc())
+        logger.error("=== QUERY FAILED (RuntimeError) ===\n%s", traceback.format_exc())
         if _is_groq_rate_limit(exc):
             raise HTTPException(status_code=503, detail=f"Groq rate limit exceeded: {exc}") from exc
         if _is_groq_unavailable(exc):
-            raise HTTPException(status_code=503, detail=f"Groq service unavailable, retry shortly: {exc}") from exc
+            raise HTTPException(status_code=503, detail=f"Groq service unavailable: {exc}") from exc
         raise HTTPException(status_code=500, detail=f"Groq inference error: {exc}") from exc
 
     except _requests.exceptions.Timeout as exc:
@@ -237,175 +261,134 @@ async def query_endpoint(req: QueryRequest):
 
     except Exception as exc:
         logger.error("=== QUERY FAILED ===\n%s", traceback.format_exc())
-        return _fallback_response(f"An unexpected error occurred: {type(exc).__name__}: {str(exc)}")
+        return _fallback_response(
+            f"An unexpected error occurred: {type(exc).__name__}: {str(exc)}"
+        )
 
 
-# ── Step 12: Google Speech-to-Text endpoint ────────────────────────────────
+# ── Speech-to-Text ─────────────────────────────────────────────────────────
+
 @app.post("/speech-to-text")
 async def speech_to_text(req: SpeechRequest):
-    """
-    Convert base64-encoded audio to text using Google Cloud Speech-to-Text REST API.
-    Falls back to browser Web Speech API if GOOGLE_SPEECH_API_KEY is not set.
-    """
     if not GOOGLE_SPEECH_API_KEY:
-        return JSONResponse(
-            status_code=200,
-            content={
-                "transcript": "",
-                "error": "Google Speech API key not configured. Set GOOGLE_SPEECH_API_KEY in .env",
-                "fallback": True,
-                "use_browser_stt": True,
-            }
-        )
+        return JSONResponse(status_code=200, content={
+            "transcript": "",
+            "error": "Google Speech API key not configured.",
+            "fallback": True,
+            "use_browser_stt": True,
+        })
 
     try:
         url = f"https://speech.googleapis.com/v1/speech:recognize?key={GOOGLE_SPEECH_API_KEY}"
-
         encoding_map = {
-            "WEBM_OPUS": "WEBM_OPUS",
-            "OGG_OPUS":  "OGG_OPUS",
-            "LINEAR16":  "LINEAR16",
-            "MP4":       "MP4",
+            "WEBM_OPUS": "WEBM_OPUS", "OGG_OPUS": "OGG_OPUS",
+            "LINEAR16": "LINEAR16",   "MP4": "MP4",
         }
-        google_encoding = encoding_map.get(req.encoding.upper(), "WEBM_OPUS")
-        lang = req.lang if req.lang else "en-US"
-
         payload = {
             "config": {
-                "encoding":        google_encoding,
+                "encoding":        encoding_map.get(req.encoding.upper(), "WEBM_OPUS"),
                 "sampleRateHertz": req.sample_rate,
-                "languageCode":    lang,
+                "languageCode":    req.lang or "en-US",
                 "enableAutomaticPunctuation": True,
                 "model": "latest_short",
             },
-            "audio": {
-                "content": req.audio_base64
-            }
+            "audio": {"content": req.audio_base64},
         }
-
         resp = _requests.post(url, json=payload, timeout=30)
-
         if resp.status_code != 200:
-            logger.error("Google Speech API error %d: %s", resp.status_code, resp.text[:200])
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "transcript": "",
-                    "error": f"Google Speech API error {resp.status_code}: {resp.text[:100]}",
-                    "fallback": True,
-                    "use_browser_stt": True,
-                }
-            )
+            return JSONResponse(status_code=200, content={
+                "transcript": "", "fallback": True, "use_browser_stt": True,
+                "error": f"Google Speech API error {resp.status_code}",
+            })
 
-        data = resp.json()
+        data    = resp.json()
         results = data.get("results", [])
         if not results:
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "transcript": "",
-                    "error": "No speech detected",
-                    "fallback": False,
-                    "use_browser_stt": False,
-                }
-            )
+            return JSONResponse(status_code=200, content={
+                "transcript": "", "error": "No speech detected",
+                "fallback": False, "use_browser_stt": False,
+            })
 
         transcript = results[0].get("alternatives", [{}])[0].get("transcript", "")
         confidence = results[0].get("alternatives", [{}])[0].get("confidence", 0.0)
-
-        logger.info("Speech-to-text: %r (confidence: %.2f)", transcript, confidence)
         return {
-            "transcript":     transcript.strip(),
-            "confidence":     confidence,
-            "fallback":       False,
-            "use_browser_stt": False,
+            "transcript": transcript.strip(), "confidence": confidence,
+            "fallback": False, "use_browser_stt": False,
         }
 
     except Exception as exc:
         logger.error("Speech-to-text failed: %s", exc)
-        return JSONResponse(
-            status_code=200,
-            content={
-                "transcript":     "",
-                "error":          str(exc),
-                "fallback":       True,
-                "use_browser_stt": True,
-            }
-        )
+        return JSONResponse(status_code=200, content={
+            "transcript": "", "error": str(exc),
+            "fallback": True, "use_browser_stt": True,
+        })
 
 
-# ── Step 12: TTS endpoint ─────────────────────────────────────────────────
+# ── TTS ────────────────────────────────────────────────────────────────────
+
 @app.post("/tts")
 async def tts_endpoint(request: Request):
-    """
-    Text-to-Speech pre-processing endpoint.
-    Cleans text and returns it for browser SpeechSynthesis.
-    No audio binary is returned — synthesis happens client-side.
-    """
     try:
         body = await request.json()
         text = (body.get("text") or "").strip()
         lang = (body.get("lang") or "en-US").strip()
 
         if not text:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "No text provided for TTS.", "tts_available": False},
-            )
+            return JSONResponse(status_code=400, content={
+                "error": "No text provided for TTS.", "tts_available": False,
+            })
 
         text = clean_text_for_tts(text)
-
         MAX_TTS_CHARS = 4000
         if len(text) > MAX_TTS_CHARS:
             text = text[:MAX_TTS_CHARS] + ". End of response."
 
         if not text:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "Text is empty after cleaning.", "tts_available": False},
-            )
+            return JSONResponse(status_code=400, content={
+                "error": "Text is empty after cleaning.", "tts_available": False,
+            })
 
-        return {
-            "text":          text,
-            "lang":          lang or "en-US",
-            "tts_available": True,
-            "char_count":    len(text),
-        }
+        return {"text": text, "lang": lang or "en-US",
+                "tts_available": True, "char_count": len(text)}
 
     except Exception as exc:
         logger.warning("TTS endpoint failed: %s", exc)
-        return JSONResponse(
-            status_code=200,
-            content={"error": f"TTS failed: {exc}", "tts_available": False},
-        )
+        return JSONResponse(status_code=200, content={
+            "error": f"TTS failed: {exc}", "tts_available": False,
+        })
 
 
 @app.get("/tts/check")
 async def tts_check():
-    """Quick endpoint for frontend to verify TTS backend is available."""
     return {"tts_available": True, "mode": "browser-native-synthesis"}
 
 
-# ── Memory management ───────────────────────────────────────────────────────
+# ── Memory ─────────────────────────────────────────────────────────────────
+
 @app.delete("/memory/{session_id}")
 def clear_memory(session_id: str):
+    if owlix is None:
+        raise HTTPException(status_code=503, detail="Service still initialising.")
     owlix.clear_memory(session_id)
     return {"status": "memory cleared", "session_id": session_id}
 
 
 # ── Global exception handler ────────────────────────────────────────────────
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.error("Unhandled exception: %s\n%s", exc, traceback.format_exc())
     return JSONResponse(
         status_code=500,
-        content={"detail": "AI processing failed. Please try again.", "type": type(exc).__name__},
+        content={
+            "detail": "AI processing failed. Please try again.",
+            "type": type(exc).__name__,
+        },
     )
 
 
-if __name__ == "__main__":
-    import os
-    import uvicorn
+# ── Entry point ────────────────────────────────────────────────────────────
 
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run("main:app", host="0.0.0.0", port=port)
