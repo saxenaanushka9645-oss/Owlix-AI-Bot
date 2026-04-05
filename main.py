@@ -62,8 +62,8 @@ async def query_endpoint(request: Request):
             return JSONResponse(status_code=422, content={"error": "Query cannot be empty"})
         result = await owlix.run(query, session_id)
         for field in ("summary","key_findings","key_events","contradictions","current_status","conclusion","uncertainty","confidence"):
-            v = result.get(field, "—")
-            result[field] = " ".join(str(x) for x in v) if isinstance(v, list) else ("—" if v is None else str(v))
+            v = result.get(field, "-")
+            result[field] = " ".join(str(x) for x in v) if isinstance(v, list) else ("-" if v is None else str(v))
         fu = result.get("followups", [])
         result["followups"] = ([str(f) for f in fu][:3] if isinstance(fu, list) else [str(fu)])
         while len(result["followups"]) < 3:
@@ -97,7 +97,6 @@ async def tts(request: Request):
             return JSONResponse(status_code=400, content={"error": "No text", "tts_available": False})
         text = re.sub(r"https?://\S+", "", text)
         text = re.sub(r"\*{1,3}([^*]+)\*{1,3}", r"\1", text)
-        text = re.sub(r"[????]", "", text)
         text = re.sub(r"\s+", " ", text).strip()
         if len(text) > 4000:
             text = text[:4000] + ". End of response."
