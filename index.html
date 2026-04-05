@@ -983,7 +983,7 @@ async function apiQuery(query, sessionId) {
 function friendlyError(err) {
   const msg = String(err?.message || err || '');
   if (msg.includes('Failed to fetch') || msg.includes('NetworkError') || msg.includes('ERR_CONNECTION_REFUSED'))
-    return { title: 'Backend not reachable', body: 'Run: uvicorn main:app --reload --host 127.0.0.1 --port 8000', retry: true };
+    return { title: 'Backend not reachable', body: 'Could not connect to https://owlix-ai-bot.onrender.com', retry: true };
   if (msg.includes('503') || msg.toLowerCase().includes('rate limit') || msg.toLowerCase().includes('quota'))
     return { title: 'Groq rate limit hit', body: 'Too many requests — please wait a moment and try again.', retry: true };
   if (msg.includes('429'))
