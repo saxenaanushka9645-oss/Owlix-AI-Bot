@@ -8,5 +8,3 @@ langchain-community
 chromadb
 google-search-results
 groq
-sentence-transformers
-torch --index-url https://download.pytorch.org/whl/cpu
