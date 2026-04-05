@@ -9,3 +9,4 @@ chromadb
 google-search-results
 groq
 sentence-transformers
+torch==2.2.2+cpu
