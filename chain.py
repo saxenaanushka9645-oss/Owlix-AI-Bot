@@ -45,7 +45,8 @@ logger = logging.getLogger("owlix.chain")
 # ── Environment variables ─────────────────────────────────────────────────────
 GROQ_API_KEY       = os.getenv("GROQ_API_KEY")
 SERPAPI_API_KEY    = os.getenv("SERPAPI_API_KEY")
-CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
+#CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
+CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "/tmp/chroma_db")
 
 GROQ_CHAT_MODEL    = os.getenv("GROQ_CHAT_MODEL", "llama-3.3-70b-versatile")
 HF_EMBEDDING_MODEL = os.getenv("HF_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
@@ -211,7 +212,22 @@ class STEmbeddingFunction(EmbeddingFunction):
 
 class STLangChainEmbeddings:
     def __init__(self, model_name: str = HF_EMBEDDING_MODEL):
-        self.model = SentenceTransformer(model_name)
+        self.model_name = model_name
+        self.model = None
+
+    def _get_model(self):
+        if self.model is None:
+            from sentence_transformers import SentenceTransformer
+            self.model = SentenceTransformer(self.model_name, device="cpu")
+        return self.model
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        model = self._get_model()
+        return model.encode(texts, show_progress_bar=False).tolist()
+
+    def embed_query(self, text: str) -> list[float]:
+        model = self._get_model()
+        return model.encode([text], show_progress_bar=False)[0].tolist()
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         return self.model.encode(texts, show_progress_bar=False).tolist()

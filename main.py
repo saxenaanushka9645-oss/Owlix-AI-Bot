@@ -30,7 +30,7 @@ from chain import OwlixChain
 
 # ── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("owlix")
@@ -404,8 +404,8 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
-if __name__ == "__main__":
+    import os
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=10000)
+
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
