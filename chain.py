@@ -139,8 +139,22 @@ Respond ONLY with valid JSON:
 class GroqInferenceClient:
     def __init__(self, api_key: str, model: str = GROQ_CHAT_MODEL):
         self.client = Groq(api_key=api_key)
-        self.model  = model
+        self.model = model
+
         logger.info("Groq client initialised — model: %s", self.model)
+
+        try:
+            models = self.client.models.list()
+            model_ids = [m.id for m in models.data]
+
+            logger.info("AVAILABLE GROQ MODELS: %s", model_ids)
+            logger.info(
+                "TARGET MODEL AVAILABLE: %s",
+                self.model in model_ids
+            )
+
+        except Exception as e:
+            logger.error("GROQ MODEL LIST FAILED: %s", e)
 
     def invoke(self, system: str, user: str) -> str:
         for attempt in range(1, 4):
