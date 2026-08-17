@@ -30,7 +30,8 @@ logger = logging.getLogger("owlix.chain")
 GROQ_API_KEY       = os.getenv("GROQ_API_KEY")
 SERPAPI_API_KEY    = os.getenv("SERPAPI_API_KEY")
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "/tmp/chroma_db")
-GROQ_CHAT_MODEL    = os.getenv("GROQ_CHAT_MODEL", "llama-3.3-70b-versatile")
+#GROQ_CHAT_MODEL    = os.getenv("GROQ_CHAT_MODEL", "llama-3.3-70b-versatile")
+GROQ_CHAT_MODEL = os.getenv("GROQ_CHAT_MODEL", "openai/gpt-oss-120b")
 
 if not GROQ_API_KEY:
     raise EnvironmentError("GROQ_API_KEY is not set in .env")
